@@ -7,12 +7,13 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-dev.h>
 #include <linux/slab.h>
+#include <media/v4l2-ioctl.h> // we need v4l2_ioctl_ops
 
 /* define our main struct for all driver */
 struct vcam_device {
     struct v4l2_device v4l2_dev; // V4L2 parent device
     struct video_device vdev;    // video device node (/dev/videoX)
-    
+    struct v4l2_pix_format fmt;  // current format
     // we will need to implement more here in the future
     // ex. queue, mutex, format, kthread
 };
