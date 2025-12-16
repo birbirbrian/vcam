@@ -7,7 +7,46 @@
 #define VCAM_HEIGHT 480
 #define VCAM_PIX_FMT V4L2_PIX_FMT_RGB24 // 24-bit RGB
 
+static const u8 vcam_colorbar[8][3] = {
+	{255, 255, 255}, /* White   */
+	{255, 255,   0}, /* Yellow  */
+	{  0, 255, 255}, /* Cyan    */
+	{  0, 255,   0}, /* Green   */
+	{255,   0, 255}, /* Magenta */
+	{255,   0,   0}, /* Red     */
+	{  0,   0, 255}, /* Blue    */
+	{  0,   0,   0}, /* Black   */
+};
+
 const char *vcam_dev_name = VCAM_DEV_NAME;
+
+/* * vcam fill color bar
+ * fill different color bar into buffer base on algorithm
+ */
+static void vcam_fill_color_bar(u8 *vaddr, unsigned int width, unsigned int height, unsigned int shift)
+{
+    unsigned int x, y;
+    unsigned int bar_width = width / 8; // 畫面切成 8 等份
+    u8 *pixel = vaddr;
+    
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++) {
+            /* * algorithm：
+             * 1. x / bar_width: which bar we are in(we will need this to choose color)
+             * 2. + shift: let bar shift, actually we are shifting color index
+             * 3. % 8: make sure it is in 0~7 range, we only have 8 colors
+             */
+            int color_index = ((x / bar_width) + shift) % 8;
+
+            // write pixel (RGB24)
+            pixel[0] = vcam_colorbar[color_index][0]; // R
+            pixel[1] = vcam_colorbar[color_index][1]; // G
+            pixel[2] = vcam_colorbar[color_index][2]; // B
+            
+            pixel += 3; // move 3 bytes
+        }
+    }
+}
 
 /* * Kthread function
  * This is a thread that will simulate camera and generate image data
@@ -54,10 +93,14 @@ static int vcam_kthread(void *data)
         // fill buffer with data
         void *vaddr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
         unsigned long size = vb2_get_plane_payload(&buf->vb.vb2_buf, 0);
+        unsigned int width = vcam->fmt.width;
+        unsigned int height = vcam->fmt.height;
 
         if(vaddr) {
-            // now we all filled with gray color(0xAA)
-            memset(vaddr, 0xAA, size);
+            // imeplemnt new color bar fill function
+            // cam->sequence / 5 -> I want to change bar every 5 frames
+            // so 5 frames will be a set and they will be the same
+            vcam_fill_color_bar(vaddr, width, height, vcam->sequence / 5);
         }
 
         // set timestamp
