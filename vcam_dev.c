@@ -9,6 +9,126 @@
 
 const char *vcam_dev_name = VCAM_DEV_NAME;
 
+/* * VB2 buffer operations
+ * We need to implement these functions: vcam_queue_setup, vcam_buf_prepare, vcam_buf_queue, vcam_start_streaming,
+ * vcam_stop_streaming
+ * These function is used to handle quene from user space.
+ */
+
+/* * Queue setup
+ * Check if the buffer size is enough for our format or we need to give the size we support
+ */
+static int vcam_queue_setup(struct vb2_queue *q,
+			   unsigned int *nbuffers, unsigned int *nplanes,
+			   unsigned int sizes[], struct device *alloc_devs[])
+{
+    // get our device struct
+    struct vcam_device *vcam = vb2_get_drv_priv(q);
+
+    // support format size
+    unsigned long size = vcam->fmt.sizeimage;
+
+if (*nplanes) {
+        // check nplanes numbers(normal case is 1)
+        if (*nplanes != 1)
+            return -EINVAL;
+
+        // check the request size is enough (can not small than current image size)
+        if (sizes[0] < size)
+            return -EINVAL;
+
+        return 0;
+    }
+
+    *nplanes = 1;         // RGB24 = 1 plane
+    sizes[0] = size;      // set buffer size
+    return 0;
+}
+
+/* * Buffer prepare
+ * Prepare/check the buffer before queueing
+ */
+static int vcam_buf_prepare(struct vb2_buffer *vb)
+{
+    // we need to use vb2_queue to get our device struct(parent struct)
+    struct vcam_device *vcam = vb2_get_drv_priv(vb->vb2_queue);
+    unsigned long size = vcam->fmt.sizeimage;
+
+    // check buffer size
+    if (vb2_plane_size(vb, 0) < size) {
+        pr_err("VCAM: Buffer too small\n");
+        return -EINVAL;
+    }
+
+    // set payload (real data size)
+    vb2_set_plane_payload(vb, 0, size);
+    return 0;
+}
+
+/* * Buffer queue
+ * When call this function, user space application has queued a buffer
+ * We need to add it to our active_list for further processing
+ */
+static void vcam_buf_queue(struct vb2_buffer *vb)
+{
+    struct vcam_device *vcam = vb2_get_drv_priv(vb->vb2_queue);
+
+    // use container_of to get vcam_buffer
+    struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+    struct vcam_buffer *buf = container_of(vbuf, struct vcam_buffer, vb);
+    unsigned long flags;
+
+    spin_lock_irqsave(&vcam->lock, flags);
+    list_add_tail(&buf->list, &vcam->active_list); // add to active_list
+    spin_unlock_irqrestore(&vcam->lock, flags);
+}
+
+/* * Start streaming
+ */
+static int vcam_start_streaming(struct vb2_queue *vq, unsigned int count)
+{
+    struct vcam_device *vcam = vb2_get_drv_priv(vq);
+    pr_info("VCAM: Start streaming (Queue enabled)\n");
+
+    // currently, there is no thread at this step, so we just return success.
+    return 0;
+}
+
+/* * Stop streaming
+ */
+static void vcam_stop_streaming(struct vb2_queue *vq)
+{
+    struct vcam_device *vcam = vb2_get_drv_priv(vq);
+    struct vcam_buffer *buf;
+    unsigned long flags;
+
+    pr_info("VCAM: Stop streaming\n");
+
+    /* * when streaming is off, we need to return all buffers in active_list
+     * to VB2 framework, otherwise application will hang.
+     */
+    spin_lock_irqsave(&vcam->lock, flags);
+    while (!list_empty(&vcam->active_list)) {
+        buf = list_first_entry(&vcam->active_list, struct vcam_buffer, list);
+        list_del(&buf->list);
+
+        // return state: error
+        vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+    }
+    spin_unlock_irqrestore(&vcam->lock, flags);
+}
+
+static const struct vb2_ops vcam_vb2_ops = {
+    .queue_setup     = vcam_queue_setup,
+    .buf_prepare     = vcam_buf_prepare,
+    .buf_queue       = vcam_buf_queue,
+    .start_streaming = vcam_start_streaming,
+    .stop_streaming  = vcam_stop_streaming,
+    .wait_prepare    = vb2_ops_wait_prepare, // standerd helper: release lock
+    .wait_finish     = vb2_ops_wait_finish,  // standerd helper: acquire lock
+};
+
+
 /* * V4L2 ioctl operations
  * We need to implement these functions: vcam_querycap, vcam_enum_fmt, vcam_g_fmt, vcam_s_fmt, vcam_try_fmt
  * These function is used to handle ioctl calls from user space applications.
@@ -34,7 +154,7 @@ static int vcam_enum_fmt_vid_cap(struct file *file, void *priv,
 	if (f->index != 0)
 		return -EINVAL;
 
-	f->pixelformat = V4L2_PIX_FMT_UYVY;
+	f->pixelformat = VCAM_PIX_FMT;
 	return 0;
 }
 
@@ -90,18 +210,29 @@ static const struct v4l2_ioctl_ops vcam_ioctl_ops = {
     .vidioc_g_fmt_vid_cap = vcam_g_fmt_vid_cap,
     .vidioc_try_fmt_vid_cap = vcam_try_fmt_vid_cap,
     .vidioc_s_fmt_vid_cap = vcam_s_fmt_vid_cap,
+
+    // add vb2 ioctl operations
+    .vidioc_reqbufs       = vb2_ioctl_reqbufs,
+    .vidioc_create_bufs   = vb2_ioctl_create_bufs,
+    .vidioc_prepare_buf   = vb2_ioctl_prepare_buf,
+    .vidioc_querybuf      = vb2_ioctl_querybuf,
+    .vidioc_qbuf          = vb2_ioctl_qbuf,
+    .vidioc_dqbuf         = vb2_ioctl_dqbuf,
+    .vidioc_streamon      = vb2_ioctl_streamon,
+    .vidioc_streamoff     = vb2_ioctl_streamoff,
 };
 
 /* * File Operations 
  */
 static int vcam_open(struct file *filp) {
     pr_info("VCAM: Device opened!\n");
-    return 0;
+    return v4l2_fh_open(filp);
 }
 
 static int vcam_release(struct file *filp) {
     pr_info("VCAM: Device closed!\n");
-    return 0;
+    vb2_fop_release(filp);
+    return v4l2_fh_release(filp);
 }
 
 static const struct v4l2_file_operations vcam_fops = {
@@ -109,6 +240,8 @@ static const struct v4l2_file_operations vcam_fops = {
     .open = vcam_open,
     .release = vcam_release,
     .unlocked_ioctl = video_ioctl2, // set to video_ioctl2 to handle ioctl calls
+    .mmap = vb2_fop_mmap,
+    .poll = vb2_fop_poll,
     // we will add more option here in the future
     // ex. .unlocked_ioctl = video_ioctl2,
 };
@@ -120,10 +253,17 @@ static void vcam_video_release(struct video_device *vdev) {
 
 /*
  * This function sets up the video device and registers it with the V4L2 framework.
+ * Init list, lock, format, vb2 queue, video device
  */
 int vcam_setup_video_device(struct vcam_device *vcam)
 {
     int ret;
+    struct vb2_queue *q = &vcam->queue;
+
+    /* init list and lock */
+    INIT_LIST_HEAD(&vcam->active_list);
+    spin_lock_init(&vcam->lock);
+    mutex_init(&vcam->queue_lock); // protect vb2_queue
 
     /* init default format */
     vcam->fmt.width = VCAM_WIDTH;
@@ -133,13 +273,30 @@ int vcam_setup_video_device(struct vcam_device *vcam)
     vcam->fmt.bytesperline = VCAM_WIDTH * 3;
     vcam->fmt.sizeimage = vcam->fmt.bytesperline * VCAM_HEIGHT;
 
-    /* init video_device */
+    /* init vb2 queue */
+    q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    q->io_modes = VB2_MMAP | VB2_USERPTR | VB2_READ; // support modes
+    q->drv_priv = vcam;
+    q->buf_struct_size = sizeof(struct vcam_buffer);
+    q->ops = &vcam_vb2_ops;          // register callback
+    q->mem_ops = &vb2_vmalloc_memops;// use vmalloc (CPU 存取)
+    q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+    q->lock = &vcam->queue_lock;     // set mutex lock
+
+    ret = vb2_queue_init(q); // after this, queue is ready
+    if (ret) {
+        pr_err("VCAM: Failed to init vb2 queue\n");
+        return ret;
+    }
+
+    /* register into video_device */
+    vcam->vdev.queue = q;
     vcam->vdev.v4l2_dev = &vcam->v4l2_dev;    // set Parent
     vcam->vdev.fops = &vcam_fops;             // set file operations
     vcam->vdev.release = vcam_video_release;
     vcam->vdev.ioctl_ops = &vcam_ioctl_ops; // set ioctl operations
     vcam->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING | V4L2_CAP_READWRITE;
-    
+
     // use this function to save driver data pointer
     // so we can get our vcam_device struct from video_device struct
     video_set_drvdata(&vcam->vdev, vcam); 
