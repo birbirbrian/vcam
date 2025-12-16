@@ -11,6 +11,10 @@
 #include <media/videobuf2-v4l2.h>   // we need vb2
 #include <media/videobuf2-vmalloc.h> // we need vb2_vmalloc
 #include <linux/mutex.h>             // mutex
+#include <linux/kthread.h> // kthread API
+#include <linux/delay.h>   // msleep, schedule_timeout
+#include <linux/sched.h>   // task_struct
+#include <linux/ktime.h>   // time
 
 /* define our main struct for all driver */
 struct vcam_device {
@@ -23,6 +27,10 @@ struct vcam_device {
     struct list_head active_list;   // save data buffer waiting for filling color
     spinlock_t lock;                // spinlock for active_list
     struct mutex queue_lock;        // protect vb2_queue
+
+    // kthread related members
+    struct task_struct *kthread;
+    u32 sequence;
 };
 
 /* * we need to define our buffer struct

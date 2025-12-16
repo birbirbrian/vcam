@@ -9,6 +9,69 @@
 
 const char *vcam_dev_name = VCAM_DEV_NAME;
 
+/* * Kthread function
+ * This is a thread that will simulate camera and generate image data
+ */
+static int vcam_kthread(void *data)
+{
+    struct vcam_device *vcam = data;
+    struct vcam_buffer *buf;
+    unsigned long flags;
+
+    // define time
+    int timeout_jiffies = msecs_to_jiffies(33); // ~30 FPS
+
+    pr_info("VCAM: Thread started running\n");
+
+    // infinite loop, if no one calls kthread_stop, it will keep running
+    while(!kthread_should_stop()) {
+
+        // sleep
+        // set ourself to be intruptible sleep
+        set_current_state(TASK_INTERRUPTIBLE);
+        schedule_timeout(timeout_jiffies);
+
+        if (kthread_should_stop())
+            break;
+
+        // get buffer from active_list
+        // we need to use spinlock to protect the list
+        spin_lock_irqsave(&vcam->lock, flags);
+
+        // if there is no buffer available for us to fill data, we juxt unlock and continue
+        if(list_empty(&vcam->active_list)) {
+            // no buffer, unlock and we continue to wait for next loop
+            spin_unlock_irqrestore(&vcam->lock, flags);
+            continue;
+        }
+
+        // get the buffer from active_list
+        buf = list_first_entry(&vcam->active_list, struct vcam_buffer, list);
+        list_del(&buf->list); // remove current buffer from active_list
+
+        spin_unlock_irqrestore(&vcam->lock, flags);
+
+        // fill buffer with data
+        void *vaddr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+        unsigned long size = vb2_get_plane_payload(&buf->vb.vb2_buf, 0);
+
+        if(vaddr) {
+            // now we all filled with gray color(0xAA)
+            memset(vaddr, 0xAA, size);
+        }
+
+        // set timestamp
+        buf->vb.vb2_buf.timestamp = ktime_get_ns();
+        buf->vb.sequence = vcam->sequence++;
+
+        // tell vb2 framework that buffer is done
+        vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+    }
+
+    pr_info("VCAM: Thread stopped\n");
+    return 0;
+}
+
 /* * VB2 buffer operations
  * We need to implement these functions: vcam_queue_setup, vcam_buf_prepare, vcam_buf_queue, vcam_start_streaming,
  * vcam_stop_streaming
@@ -90,7 +153,28 @@ static int vcam_start_streaming(struct vb2_queue *vq, unsigned int count)
     struct vcam_device *vcam = vb2_get_drv_priv(vq);
     pr_info("VCAM: Start streaming (Queue enabled)\n");
 
-    // currently, there is no thread at this step, so we just return success.
+    vcam->sequence = 0;
+
+    // start kthread
+    vcam->kthread = kthread_run(vcam_kthread, vcam, "vcam-worker");
+
+    // if 
+    if(IS_ERR(vcam->kthread)) {
+        pr_err("VCAM: Failed to create kernel thread\n");
+
+        struct vcam_buffer *buf;
+        unsigned long flags;
+        spin_lock_irqsave(&vcam->lock, flags);
+        while (!list_empty(&vcam->active_list)) {
+            buf = list_first_entry(&vcam->active_list, struct vcam_buffer, list);
+            list_del(&buf->list);
+            vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
+        }
+        spin_unlock_irqrestore(&vcam->lock, flags);
+        return PTR_ERR(vcam->kthread);
+    }
+
+    pr_info("VCAM: Start streaming (Thread running)\n");
     return 0;
 }
 
@@ -104,6 +188,12 @@ static void vcam_stop_streaming(struct vb2_queue *vq)
 
     pr_info("VCAM: Stop streaming\n");
 
+    // stop kthread
+    if (vcam->kthread) {
+        kthread_stop(vcam->kthread);
+        vcam->kthread = NULL;
+    }
+
     /* * when streaming is off, we need to return all buffers in active_list
      * to VB2 framework, otherwise application will hang.
      */
@@ -116,6 +206,7 @@ static void vcam_stop_streaming(struct vb2_queue *vq)
         vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
     }
     spin_unlock_irqrestore(&vcam->lock, flags);
+    pr_info("VCAM: Stop streaming\n");
 }
 
 static const struct vb2_ops vcam_vb2_ops = {
