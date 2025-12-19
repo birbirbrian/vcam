@@ -20,15 +20,54 @@ static const u8 vcam_colorbar[8][3] = {
 
 const char *vcam_dev_name = VCAM_DEV_NAME;
 
+static int vcam_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+    struct vcam_device *vcam = container_of(ctrl->handler, struct vcam_device, ctrl_handler);
+
+    // handle all control cases
+    switch(ctrl->id){
+        case V4L2_CID_EXPOSURE:
+            vcam->exposure = ctrl->val;
+            pr_info("VCAM: Exposure set to %d\n", vcam->exposure);
+            break;
+        default:
+            return -EINVAL;
+    }
+    return 0;
+}
+
+/* * Control operations
+ */ 
+static const struct v4l2_ctrl_ops vcam_ctrl_ops = {
+    .s_ctrl = vcam_s_ctrl,
+};
+
+static inline u8 clamp_u8(int val)
+{
+    if(val < 0)
+        return 0;
+    if(val > 255)
+        return 255;
+    return (u8)val;
+}
+
 /* * vcam fill color bar
  * fill different color bar into buffer base on algorithm
  */
-static void vcam_fill_color_bar(u8 *vaddr, unsigned int width, unsigned int height, unsigned int shift)
+static void vcam_fill_color_bar(u8 *vaddr, unsigned int width, unsigned int height, unsigned int shift, s32 exposure)
 {
     unsigned int x, y;
     unsigned int bar_width = width / 8; // 畫面切成 8 等份
     u8 *pixel = vaddr;
-    
+    u8 scale_color[8][3];
+
+    // chage exposure, scale my color structure with exposure weight
+    for(int i = 0; i < 8; i++ ) {
+        scale_color[i][0] = clamp_u8((vcam_colorbar[i][0] * exposure) / 255); // R
+        scale_color[i][1] = clamp_u8((vcam_colorbar[i][1] * exposure) / 255); // G
+        scale_color[i][2] = clamp_u8((vcam_colorbar[i][2] * exposure) / 255); // B
+    }
+
     for (y = 0; y < height; y++) {
         for (x = 0; x < width; x++) {
             /* * algorithm：
@@ -39,9 +78,9 @@ static void vcam_fill_color_bar(u8 *vaddr, unsigned int width, unsigned int heig
             int color_index = ((x / bar_width) + shift) % 8;
 
             // write pixel (RGB24)
-            pixel[0] = vcam_colorbar[color_index][0]; // R
-            pixel[1] = vcam_colorbar[color_index][1]; // G
-            pixel[2] = vcam_colorbar[color_index][2]; // B
+            pixel[0] = scale_color[color_index][0]; // R
+            pixel[1] = scale_color[color_index][1]; // G
+            pixel[2] = scale_color[color_index][2]; // B
             
             pixel += 3; // move 3 bytes
         }
@@ -92,7 +131,6 @@ static int vcam_kthread(void *data)
 
         // fill buffer with data
         void *vaddr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
-        unsigned long size = vb2_get_plane_payload(&buf->vb.vb2_buf, 0);
         unsigned int width = vcam->fmt.width;
         unsigned int height = vcam->fmt.height;
 
@@ -100,7 +138,7 @@ static int vcam_kthread(void *data)
             // imeplemnt new color bar fill function
             // cam->sequence / 5 -> I want to change bar every 5 frames
             // so 5 frames will be a set and they will be the same
-            vcam_fill_color_bar(vaddr, width, height, vcam->sequence / 5);
+            vcam_fill_color_bar(vaddr, width, height, vcam->sequence / 5, vcam->exposure);
         }
 
         // set timestamp
@@ -431,6 +469,21 @@ int vcam_setup_video_device(struct vcam_device *vcam)
     vcam->vdev.ioctl_ops = &vcam_ioctl_ops; // set ioctl operations
     vcam->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING | V4L2_CAP_READWRITE;
 
+
+    /* regist control handler */
+    v4l2_ctrl_handler_init(&vcam->ctrl_handler, 1);
+
+    // Allocate and initialize a new standard V4L2 non-menu control.
+    v4l2_ctrl_new_std(&vcam->ctrl_handler, &vcam_ctrl_ops,
+                      V4L2_CID_EXPOSURE, 0, 255, 1, 128);
+
+    /* initial exposure data */
+    vcam->exposure = 128;
+
+    // regist handler to v4l2_device
+    vcam->v4l2_dev.ctrl_handler = &vcam->ctrl_handler;
+    vcam->vdev.ctrl_handler = &vcam->ctrl_handler;
+
     // use this function to save driver data pointer
     // so we can get our vcam_device struct from video_device struct
     video_set_drvdata(&vcam->vdev, vcam); 
@@ -449,4 +502,5 @@ int vcam_setup_video_device(struct vcam_device *vcam)
 void vcam_cleanup_video_device(struct vcam_device *vcam)
 {
     video_unregister_device(&vcam->vdev);
+    v4l2_ctrl_handler_free(&vcam->ctrl_handler);
 }

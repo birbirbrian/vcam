@@ -15,6 +15,8 @@
 #include <linux/delay.h>   // msleep, schedule_timeout
 #include <linux/sched.h>   // task_struct
 #include <linux/ktime.h>   // time
+#include <media/v4l2-ctrls.h> // we need vb2_vmalloc
+
 
 /* define our main struct for all driver */
 struct vcam_device {
@@ -31,6 +33,9 @@ struct vcam_device {
     // kthread related members
     struct task_struct *kthread;
     u32 sequence;
+
+    struct v4l2_ctrl_handler ctrl_handler; // control handler
+    s32 exposure;                          // 0~255
 };
 
 /* * we need to define our buffer struct
